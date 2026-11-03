@@ -1,220 +1,250 @@
-# 자비스(JARVIS)형 음성 비서 서비스 구축 플랜 — Gemini 단일 스택
+# 자비스(JARVIS)형 음성 비서 서비스 구축 플랜 v3
 
-작성일: 2026-11-03 (v2: Gemini 전면 채택으로 변경)
-대상: 사내 테스트 → 외부 사용자 서비스로 확장
-AI 엔진: **Google Gemini 전체 사용** (음성·판단·도구 호출·문서 이해 모두 Gemini)
-
----
-
-## 0. 한 줄 결론
-
-**가능하며, Gemini 단일 스택이 구조적으로 가장 단순합니다.**
-
-- **음성 + 두뇌**: `gemini-3.8-live` 한 모델이 듣기·판단·도구 호출·말하기를 모두 처리 (speech-to-speech, 별도 STT/TTS 불필요)
-- **무거운 작업(견적서 판독, 긴 문서, 코드)**: Live 모델이 `gemini-3.8-flash` / `gemini-3.8-pro` 서브에이전트를 도구처럼 호출
-- **프레임워크**: Google **ADK**(Agent Development Kit) `run_live()` + **Vertex AI Agent Engine**(세션·메모리 뱅크 내장)
-- **클라이언트**: 브라우저/앱이 **Ephemeral Token**으로 Gemini Live WebSocket에 직접 연결 → 오디오가 우리 서버를 거치지 않아 지연·인프라 최소
-- **Google Workspace 연동**: 같은 Google 생태계라 OAuth·API·MCP가 가장 매끄러움
-
-v1(Claude 두뇌 + 외부 음성 스택) 대비 장점: 구성 요소 3개 → 1개, 지연 최저, 끼어들기·감정 톤·선제 발화(proactive audio) 기본 제공.
-단점: Google 종속, Live 모델 컨텍스트가 작아(약 128K) 긴 세션은 압축 필요, 복잡 추론은 Pro 모델 위임 필요.
+작성일: 2026-11-03
+v3 변경점: "기술이 되느냐"가 아니라 **승부처 3가지**를 중심으로 재구성
+AI 스택: Google Gemini 전체 사용 (gemini-3.8-live / 3.8-flash / 3.8-pro, ADK, Agent Engine)
 
 ---
 
-## 1. 요구사항 → 구현 매핑
+## 0. 전략 요약
 
-| # | 요구사항 | Gemini 스택 구현 |
+시장 조사 결과, 음성 우선 + 기업용 + 자체 앱 조작을 모두 갖춘 서비스는 없다. 기술 장벽은 2025~2026년에 사라졌고, 남은 장벽은 **신뢰·수요 형태·유통**이다. 따라서 이 프로젝트는 아래 세 가지에서 이기는 것을 목표로 한다.
+
+| 승부처 | 한 줄 정의 | 성공 지표 |
 |---|---|---|
-| R1 | 음성으로 메일 발송 | Live 모델이 `gmail_send` 함수 호출 → 발송 전 음성 확인 게이트 |
-| R2 | 견적서 업로드 | 사진/파일 → `gemini-3.8-flash` 서브에이전트가 거래처·금액·날짜 추출 → Drive 업로드 + Sheets 기록 |
-| R3 | 스케줄 등록 | `calendar_create` 함수, 자연어 날짜 해석은 Live 모델이 담당 |
-| R4 | 직접 만든 앱 조작 (GitHub) | 레포의 OpenAPI 스펙/`jarvis.manifest.json` → ADK `OpenAPIToolset`로 자동 도구화, 코드 작업은 Jules/Gemini CLI 비동기 |
-| R5 | 비서 업무 전반 | Google Search 그라운딩, Memory Bank(장기 기억), 리마인더 |
-| R6 | 조작 단순 | 푸시투톡 1버튼, 선제 발화로 "자비스"라고 부르면 반응 (proactive audio) |
-| R7 | 외부 사용자 연동 용이 | "Google로 로그인" 1회로 Gmail/Drive/Calendar 동시 동의, 앱은 GitHub App 설치 1회 |
+| **① 신뢰: 오발송 0건** | 되돌릴 수 없는 행동은 반드시 확인·취소·기록된다 | 파일럿 기간 잘못된 발송·삭제 0건, 확인 단계 포기율 < 10% |
+| **② 좁고 깊은 업무** | 범용 비서가 아니라 "견적·발주·일정" 세 업무를 완벽히 | 세 업무 음성 완료율 ≥ 90%, 주당 1인 사용 횟수 ≥ 15회 |
+| **③ 자체 앱 연동** | 개발자가 파일 1개 + 설치 1회로 자기 앱을 자비스에 붙인다 | 신규 앱 등록 30분 이내, 등록 후 코드 수정 0줄 |
+
+**하지 않을 것**: 범용 잡담 비서, 빅테크 앱과 기능 경쟁, 처음부터 모든 SaaS 연동. 사내 세 업무가 완벽해지기 전엔 범위를 넓히지 않는다.
 
 ---
 
-## 2. 모델 역할 분담
+## 1. 승부처 ① 신뢰 설계 — "오발송 0건"
 
-| 역할 | 모델 | 이유 |
+### 1.1 행동 등급 (모든 도구에 필수 부여)
+
+| 등급 | 예시 | 실행 규칙 |
 |---|---|---|
-| 실시간 대화·도구 호출 (메인) | `gemini-3.8-live` | 네이티브 오디오, 비동기 함수 호출 기본(NON_BLOCKING), 함수 스케줄링(SILENT / WHEN_IDLE / INTERRUPTED), 선제 발화 |
-| 문서·이미지 판독, 긴 요약, 대량 메일 분류 | `gemini-3.8-flash` | 1M 컨텍스트, 비전·문서 이해, 저렴 |
-| 복잡 판단(계약 검토, 다단계 계획) | `gemini-3.8-pro` | 고추론. Live가 `ask_expert(question)` 함수로 위임 |
-| 코드 수정·배포·PR | Jules / Gemini CLI (비동기) | 음성 세션과 분리해 완료 시 결과만 보고 |
+| `auto` | 메일 검색, 일정 조회, 파일 찾기 | 즉시 실행, 결과만 보고 |
+| `confirm` | 일정 등록, 드라이브 업로드, 초안 저장 | 요약을 읽어주고 "할까요?" 1회 확인 |
+| `strict` | 메일 발송, 발주 전송, 삭제, 결제, 배포 | **핵심 값(수신자·금액·대상)을 읽어주고** 명시적 긍정("응", "보내", "진행")만 허용. 10초 무응답·모호한 답("음…")은 취소 |
 
-> 핵심 패턴: **Live 모델은 "접수·판단·보고"만 하고, 오래 걸리는 일은 서브에이전트에 넘긴 뒤 비동기 함수 결과가 오면 WHEN_IDLE로 자연스럽게 끼어들어 알려줌.** 사용자는 기다리지 않습니다.
+- 등급은 **모델이 아니라 서버 정책 엔진이 강제**한다. 모델이 `gmail_send`를 호출해도 서버가 확인 토큰 없이는 실행하지 않는다.
+- `strict` 확인 발화는 모델 자유 생성이 아니라 **서버가 만든 고정 템플릿**을 읽게 한다 ("김OO 부장님께, 제목 'A사 견적서', 첨부 1개. 보낼까요?"). 모델이 핵심 값을 빠뜨리거나 꾸며낼 여지를 없앤다.
 
----
+### 1.2 오인식 방어 (음성 고유 리스크)
 
-## 3. 시스템 아키텍처
+- **고유명사 사전**: 사용자별 연락처·거래처·프로젝트명을 세션 시스템 프롬프트에 주입하고, 수신자 확정 시 사전과 매칭된 정식 이름·이메일을 읽어준다.
+- **유사 이름 경고**: 후보가 2개 이상이거나 편집거리 1 이내 이름이 있으면 반드시 선택지를 제시한다 ("김부장님이 두 분인데 김영수, 김영숙 중 누구요?").
+- **수량·금액 복창**: 숫자는 단위까지 복창 ("삼백이십만 원").
+- **신규 수신자 2중 확인**: 사전에 없는 이메일 주소로 보낼 때는 주소를 한 글자씩 읽어주거나 화면에 표시해 확인.
 
-```
-┌────────────────────┐  WebSocket(Ephemeral Token)  ┌──────────────────────────┐
-│ 클라이언트            │ ◀──────────────────────────▶ │ Gemini Live API           │
-│ 웹 PWA / 모바일      │   오디오 양방향 스트림          │ gemini-3.8-live           │
-│ 푸시투톡 · 화면공유   │                              │ (VAD·끼어들기·음성 생성)   │
-└─────────┬──────────┘                              └─────────────┬────────────┘
-          │ 토큰 발급 / 로그인                                      │ function call (async)
-          ▼                                                       ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ Jarvis Agent (Google ADK, Python)  — Vertex AI Agent Engine 배포                │
-│  LlmAgent(live) ── tools ──┬─ Workspace tools (Gmail/Drive/Calendar/Sheets)    │
-│                            ├─ GitHub remote MCP                                │
-│                            ├─ App Registry (OpenAPIToolset, 사용자 앱 자동 등록) │
-│                            ├─ ask_expert → gemini-3.8-pro 서브에이전트          │
-│                            ├─ read_document → gemini-3.8-flash 서브에이전트     │
-│                            └─ google_search (그라운딩)                          │
-│  정책 엔진: 발송/삭제/배포는 음성 확인 강제 (ADK Tool Confirmation + 자체 게이트)  │
-│  Sessions(대화 상태) · Memory Bank(장기 기억) · Cloud Logging(감사)              │
-└──────────────────────────────────────────────────────────────────────────────┘
-          │                                   │
-          ▼                                   ▼
-   Secret Manager (사용자별 OAuth 토큰)   Firestore / Cloud SQL (앱 레지스트리, 감사로그)
-```
+### 1.3 되돌리기와 기록
 
-### 3.1 연결 방식 두 가지 (둘 다 지원, 단계별 선택)
+- **발송 후 30초 취소 창**: Gmail은 지연 발송 큐에 넣고 30초 뒤 실제 전송. "취소" 한마디로 회수.
+- **삭제는 휴지통만**: 영구 삭제 도구는 제공하지 않는다.
+- **감사 로그**: 모든 도구 호출에 대해 (누가, 언제, 어떤 음성 전사로, 어떤 확인 응답으로, 무엇을 실행했는지)를 저장. 관리자 대시보드에서 조회.
+- **일일 요약 메일**: 자비스가 그날 대신 실행한 행동 목록을 사용자에게 보낸다 (사후 검증 + 신뢰 형성).
 
-| 방식 | 흐름 | 장점 | 단점 | 사용 시점 |
-|---|---|---|---|---|
-| **A. 클라이언트 직결** | 서버가 Ephemeral Token 발급(모델·시스템 프롬프트·도구를 토큰에 고정) → 브라우저가 `@google/genai` `live.connect()`로 직접 연결 → 함수 호출은 클라이언트가 받아 우리 백엔드 REST로 실행 | 오디오 중계 서버 불필요, 지연 최저 | 함수 실행 왕복이 클라이언트 경유 | P1 MVP |
-| **B. 서버 중계 (ADK run_live)** | 브라우저 ↔ 우리 서버(WebSocket) ↔ Gemini Live. ADK `LiveRequestQueue`로 오디오 전달, 도구는 서버에서 실행 | 도구·세션·메모리·정책을 서버가 완전 통제, 멀티유저 관리 쉬움 | 오디오 중계 비용, 지연 +100~200ms | P2 이후 정식 |
+### 1.4 신뢰 지표 계측
 
-### 3.2 세션 운영 규칙 (Live API 제약 대응)
-
-- 오디오 전용 세션은 **압축 없이 15분 제한** → `context_window_compression` 항상 켜기
-- **session resumption** 켜기 (네트워크 끊김·토큰 만료 시 재접속), Ephemeral Token은 `uses: 1`, 30분 메시지 창
-- 커뮤니티 보고: 압축을 켜도 약 58분에 세션이 닫힌 사례 있음 → 55분마다 선제적으로 재접속 로직 포함, 실측 필요
-- Live 컨텍스트 ~128K → 긴 문서는 절대 Live에 넣지 않고 Flash 서브에이전트가 요약본만 반환
-
-### 3.3 안전 정책 (필수)
-
-| 행위 | 정책 |
-|---|---|
-| 읽기(메일 검색, 일정 조회) | 즉시 실행 (NON_BLOCKING, 결과는 WHEN_IDLE로 보고) |
-| 생성(일정 등록, 업로드) | 요약 읽어주고 "등록할까요?" 1회 확인 |
-| 발송·삭제·결제·배포 | 수신자/제목 읽어주고 명시적 "응/보내" 확인, 10초 무응답 시 취소, 발송 후 30초 "취소" 윈도우 |
-| 사용자 앱 조작 | 매니페스트 `risk` 등급(`auto` / `confirm` / `strict`)에 따라 위 규칙 적용 |
-
-확인은 모델 판단에 맡기지 않고 **서버 정책 엔진이 도구 실행 직전에 강제**합니다 (ADK Tool Confirmation 사용, 직결 모드에서는 백엔드 REST가 확인 토큰 요구).
+- `strict` 확인 단계에서 "아니"로 취소된 비율 → 모델 해석 오류율의 대리 지표
+- 30초 취소 사용 횟수
+- 사후 사용자 신고(잘못된 행동) 건수 — 목표 0
 
 ---
 
-## 4. Google Workspace 연동
+## 2. 승부처 ② 좁고 깊은 업무 — 사내 세 업무
 
-| 서비스 | 1차(사내) | 2차(외부 사용자) |
+범용 "뭐든 해주는 비서" 대신 아래 세 업무를 **끝까지** 처리한다. 각 업무는 시작부터 완료까지 음성만으로 닫혀야 한다.
+
+### 2.1 업무 A: 견적서 처리
+| 단계 | 동작 | 모델 |
 |---|---|---|
-| Gmail | Gmail REST API를 ADK 함수 도구로 래핑 (send, search, draft) | 동일 + Google 공식 Gmail 원격 MCP가 GA되면 교체 |
-| Drive | Drive API (upload, search, 폴더 규칙) | 공식 Drive MCP(현재 Developer Preview, `drive.file` 스코프) |
-| Calendar | Calendar API (create, list, freebusy) | 공식 Calendar MCP(현재 프리뷰, 읽기 위주 스코프라 생성은 API 유지) |
-| Sheets | 견적서 장부 기록 | 동일 |
+| 접수 | "이 견적서 올려줘" + 사진/PDF/화면 공유 | Live |
+| 판독 | 거래처·품목·금액·날짜·유효기간 추출, 누락 시 되물음 | 3.8-flash 서브에이전트 |
+| 저장 | `/견적서/{연도}/{거래처}/` 업로드, 견적 장부(Sheets) 행 추가 | Drive, Sheets 도구 (`confirm`) |
+| 후속 | "김부장님한테 보내줘" → 수신자 확정 → 발송 | Gmail (`strict`) |
+| 조회 | "지난달 A사 견적 얼마였지?" | Sheets 조회 (`auto`) |
 
-- OAuth: Google Identity "Google로 로그인" 1회에 필요한 스코프 일괄 동의 → refresh token을 Secret Manager에 사용자별 저장
-- 사내는 Workspace 도메인 내부 OAuth 앱으로 심사 생략, 외부 서비스 전환 시 **Google OAuth 앱 검증(민감 스코프 심사)** 필요 — 4~6주 소요, P3 초반에 착수
+### 2.2 업무 B: 발주·거래처 연락
+- "A사에 지난번 견적대로 발주 넣어줘" → 장부에서 견적 조회 → 발주서 초안 생성(템플릿) → **금액·품목·수신자 복창** → 발송(`strict`)
+- "A사 담당자한테 납기 언제냐고 물어봐" → 메일 초안 → 확인 → 발송
+
+### 2.3 업무 C: 일정·리마인드
+- "내일 3시 B사 미팅 잡아줘, 참석자 김부장" → 겹침 확인 → 등록(`confirm`) → 초대 발송
+- "회의 10분 전에 알려줘" → 서버 스케줄러가 세션에 이벤트 주입 → 선제 발화
+- "오늘 일정 읽어줘" (`auto`)
+
+### 2.4 업무 선정 기준 (확장 시 적용)
+새 업무를 추가할 때는 아래 4개를 모두 만족해야 한다.
+1. 주 3회 이상 반복되는가
+2. 손으로 하면 3분 이상 걸리는가
+3. 음성이 손보다 편한 상황(이동·현장·멀티태스킹)에서 발생하는가
+4. 되돌리기 설계가 가능한가
+
+### 2.5 평가셋
+- 세 업무 × 각 20개 = **60개 한국어 음성 시나리오** (정상 15, 모호 3, 오인식 유도 2)
+- 매 배포마다 자동 실행: 완료율, 확인 정확도, 왕복 지연 p50/p95, 오행동 수
 
 ---
 
-## 5. "직접 만든 앱" 연동 (GitHub)
+## 3. 승부처 ③ 자체 앱 연동 — "파일 1개 + 설치 1회"
 
-**레벨 1 — OpenAPI 스펙 또는 매니페스트 (권장, 가장 쉬움)**
-레포 루트에 `openapi.yaml` 또는 `jarvis.manifest.json`을 두면 GitHub App 웹훅으로 읽어 ADK `OpenAPIToolset`이 함수 도구를 자동 생성. 각 엔드포인트에 `x-jarvis-risk: confirm` 같은 확장 필드로 확인 등급 지정.
+### 3.1 개발자 경험 목표
+1. 자비스 GitHub App을 레포에 설치 (1회)
+2. 레포 루트에 `jarvis.manifest.json` 커밋
+3. 30분 안에 "자비스, 재고 앱에서 A사 발주 넣어줘"가 동작
+
+### 3.2 매니페스트 규격 (v1)
 
 ```json
 {
+  "version": 1,
   "name": "재고관리앱",
+  "description": "거래처 발주와 재고 조회",
   "openapi": "./openapi.yaml",
-  "auth": { "type": "oauth2", "token_url": "https://inv.example.com/oauth/token" },
-  "risk_overrides": { "POST /orders": "confirm", "DELETE /orders/{id}": "strict" }
+  "auth": { "type": "oauth2", "authorize_url": "...", "token_url": "...", "scopes": ["orders:write"] },
+  "actions": {
+    "GET /stock":           { "risk": "auto",    "say": "재고 조회" },
+    "POST /orders":         { "risk": "strict",  "say": "발주 전송", "confirm_fields": ["vendor", "total_amount"] },
+    "DELETE /orders/{id}":  { "risk": "strict",  "say": "발주 취소", "confirm_fields": ["id"] }
+  },
+  "vocabulary": ["발주", "재고", "입고"]
 }
 ```
 
-**레벨 2 — 앱이 MCP 서버 노출**
-Streamable HTTP MCP URL만 등록. ADK `MCPToolset`으로 연결.
+- `risk`는 필수. 없으면 등록 거부 (신뢰 설계와 연결).
+- `confirm_fields`: `strict` 확인 템플릿에 반드시 읽어줄 필드.
+- `vocabulary`: 음성 인식 사전에 추가할 앱 고유 용어.
+- OpenAPI가 없는 앱은 `actions`에 `method/path/input_schema`를 직접 기술 가능.
 
-**레벨 3 — 코드 레벨 조작**
-"배포해", "버그 고쳐서 PR 올려" → Jules(비동기 코딩 에이전트) 또는 Gemini CLI를 Cloud Run Job으로 실행, 완료 시 Live 세션에 WHEN_IDLE 함수 결과로 "PR 올렸어요" 보고.
+### 3.3 등록 파이프라인
+GitHub App 웹훅(push) → 매니페스트 검증(스키마·risk 필수·설명 길이 제한·인젝션 패턴 검사) → ADK `OpenAPIToolset`으로 도구 생성 → 사용자별 OAuth 연결 → **등록 직후 자동 스모크 테스트**("재고 조회해줘" 1회 실행) → 결과를 PR 코멘트로 보고.
 
----
+### 3.4 앱이 MCP를 노출하는 경우
+`"mcp": { "url": "https://app.example.com/mcp" }` 한 줄로 등록. ADK `MCPToolset` 연결. risk 등급은 매니페스트에서 도구 이름별로 지정.
 
-## 6. 핵심 업무 흐름 예시
+### 3.5 안전 경계
+- 사용자 앱 도구는 별도 네임스페이스(`app_재고관리앱_*`)로 분리, Workspace 도구와 혼동 방지
+- 매니페스트 설명문은 모델에 그대로 노출되므로 길이 제한(200자)과 금칙 패턴 검사
+- 앱 호출 실패·타임아웃은 사용자에게 "앱이 응답하지 않아요"로 보고하고 재시도하지 않음(중복 발주 방지)
 
-**"자비스, 김부장님한테 어제 견적서 보내줘"**
-1. Live 모델이 `contacts_search("김부장")`, `drive_search(name~견적, modified=yesterday)` 두 함수를 **동시에 비동기 호출**, "찾아볼게요" 하고 즉시 응답
-2. 결과 도착 → 후보 여러 개면 "A사 견적서와 B사 견적서 중 어떤 거요?"
-3. `gmail_send` 호출 → 정책 엔진이 가로채 확인 요구 → "김OO 부장님께 A사 견적서.pdf 첨부해서 보낼게요. 보낼까요?"
-4. "응" → 발송 → "보냈습니다." (목표 왕복 3~5초)
-
-**"이 견적서 올려줘"** (사진 첨부 또는 화면 공유)
-1. Live가 `read_document(image)` → Flash 서브에이전트가 거래처·금액·날짜 JSON 반환
-2. `/견적서/{연도}/{거래처}` 업로드 + Sheets 행 추가
-3. "A사 320만원 견적서를 2026/A사 폴더에 올리고 장부에 기록했어요."
-
-**선제 알림**: 서버 스케줄러가 회의 10분 전 세션에 텍스트 이벤트 주입 → 모델이 "10분 뒤 회의예요" 발화 (proactive audio)
+### 3.6 코드 레벨 작업 (개발자용, P4)
+"배포해", "버그 고쳐서 PR 올려"는 Jules 또는 Gemini CLI를 Cloud Run Job으로 비동기 실행. 결과는 WHEN_IDLE 함수 결과로 세션에 보고. 머지·배포는 항상 `strict`.
 
 ---
 
-## 7. 단계별 로드맵
+## 4. 시스템 아키텍처 (Gemini 단일 스택)
 
-| 단계 | 기간 | 산출물 | 완료 기준 |
-|---|---|---|---|
-| **P0 텍스트 PoC** | 1주 | ADK 에이전트 + Gmail/Calendar/Drive 도구 3개, `adk web` 텍스트 UI | 메일 발송·일정 등록·업로드 텍스트 성공 |
-| **P1 음성 MVP** | 2주 | 방식 A(직결) 웹 PWA, Ephemeral Token 서버, 확인 게이트 | 한국어 음성으로 P0 시나리오 성공, 왕복 지연 p50 < 2초 |
-| **P2 사내 파일럿** | 3~4주 | 방식 B(ADK run_live) 전환, Agent Engine 배포, 멀티유저 OAuth, Memory Bank, 견적서 Flash 판독, 앱 레벨1, 감사 로그 | 사내 5~10명 2주 사용, 성공률 ≥ 90%, 오발송 0건, 55분 재접속 안정 |
-| **P3 제품화** | 4~6주 | Google OAuth 앱 검증, 셀프 온보딩 UI, 앱 등록 UI, 모바일, 과금 | 외부 사용자 10분 내 온보딩, 보안 점검 통과 |
-| **P4 고도화** | 지속 | 화면/카메라 공유(멀티모달), 전화 연결, 아바타, Jules 코드 작업 | — |
+```
+┌──────────────────┐ WebSocket(Ephemeral Token) ┌─────────────────────┐
+│ 클라이언트         │ ◀────────────────────────▶ │ Gemini Live API      │
+│ 웹 PWA / 모바일    │        오디오 양방향         │ gemini-3.8-live      │
+│ 푸시투톡 · 화면공유 │                            └──────────┬──────────┘
+└────────┬─────────┘                                       │ function call (async)
+         │ 로그인·토큰                                       ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ Jarvis Agent (Google ADK, Python) — Vertex AI Agent Engine              │
+│  ┌──────────────┐  ┌──────────────────┐  ┌──────────────────────────┐  │
+│  │ 정책 엔진      │  │ Workspace 도구    │  │ App Registry             │  │
+│  │ auto/confirm/ │  │ Gmail·Drive·     │  │ OpenAPIToolset·MCPToolset│  │
+│  │ strict 강제   │  │ Calendar·Sheets  │  │ 매니페스트 검증·스모크테스트│  │
+│  │ 30초 취소 큐   │  └──────────────────┘  └──────────────────────────┘  │
+│  │ 감사 로그      │  read_document → 3.8-flash   ask_expert → 3.8-pro   │
+│  └──────────────┘  Sessions · Memory Bank · 고유명사 사전 주입           │
+└────────────────────────────────────────────────────────────────────────┘
+      Secret Manager(OAuth 토큰)   Firestore(앱 레지스트리)   Cloud SQL(감사로그)
+```
+
+### 4.1 모델 역할
+| 역할 | 모델 |
+|---|---|
+| 실시간 대화, 도구 호출, 확인 발화 | `gemini-3.8-live` (비동기 함수 호출, WHEN_IDLE 보고, 선제 발화) |
+| 견적서·문서 판독, 긴 메일 요약 | `gemini-3.8-flash` |
+| 복잡 판단(계약 조항, 다단계 계획) | `gemini-3.8-pro` (`ask_expert`) |
+| 코드 작업 (P4) | Jules / Gemini CLI 비동기 |
+
+### 4.2 세션 운영
+- 오디오 세션 15분 제한 → `context_window_compression` + `session_resumption` 항상 켜기
+- 커뮤니티 보고(58분 종료) 대응: 55분 선제 재접속, P2에서 장시간 테스트
+- Live 컨텍스트 ~128K → 문서 원문은 Flash만 보고 Live는 요약·구조화 결과만 받음
+
+### 4.3 연결 방식
+- P1: 클라이언트 직결(Ephemeral Token, `uses:1`, 시스템 프롬프트·도구를 토큰에 고정). 함수 실행은 백엔드 REST, `strict`는 확인 토큰 필수
+- P2 이후: ADK `run_live()` 서버 중계로 전환 (정책·세션·멀티유저 완전 통제)
+
+### 4.4 Workspace 연동
+- Gmail/Drive/Calendar/Sheets REST API를 ADK 함수 도구로 래핑 (Google 공식 MCP는 프리뷰·읽기 위주라 GA 후 교체)
+- 사내: Workspace 내부 OAuth 앱 (심사 생략)
+- 외부: Google OAuth 민감 스코프 검증 4~6주 → P2 중 착수
 
 ---
 
-## 8. 기술 스택
+## 5. 로드맵 (승부처 검증 순서)
 
-| 영역 | 선택 | 비고 |
-|---|---|---|
-| 에이전트 | Python 3.12, Google ADK (`google-adk`), `google-genai` SDK | ADK JS는 Live 스트리밍이 아직 PR 단계라 Python 고정 |
-| 모델 | gemini-3.8-live / gemini-3.8-flash / gemini-3.8-pro | Vertex AI 경유(기업 데이터 처리 조건), 개발 초기엔 Gemini API 키 |
-| 배포 | Vertex AI Agent Engine (Sessions, Memory Bank) + Cloud Run (토큰 발급·웹훅·REST) | |
-| 클라이언트 | React PWA (TypeScript) + `@google/genai` live.connect | 이후 Flutter/React Native |
-| 데이터 | Firestore(앱 레지스트리, 사용자), Cloud SQL(감사로그), Secret Manager(OAuth 토큰) | |
-| 도구 | Workspace REST API 래핑, GitHub remote MCP, OpenAPIToolset, MCPToolset | |
+| 단계 | 기간 | 검증하는 승부처 | 산출물 | 완료 기준 |
+|---|---|---|---|---|
+| **P0 텍스트 PoC** | 1주 | ② 업무 정의 | ADK 에이전트, 업무 A·C 도구, 정책 엔진 골격, 평가셋 60개 초안 | 텍스트로 업무 A·C 완료 |
+| **P1 음성 MVP** | 2주 | ① 신뢰 1차 | 직결 웹 PWA, strict 템플릿 확인, 30초 취소, 고유명사 사전, 감사 로그 | 음성으로 업무 A·C 완료율 ≥ 80%, 오발송 0, 지연 p50 < 2초 |
+| **P2 사내 파일럿** | 4주 | ① + ② | ADK 서버 중계, Agent Engine, 멀티유저 OAuth, 업무 B 추가, 일일 요약 메일, 관리자 대시보드 | 5~10명 2주 사용, 완료율 ≥ 90%, 오발송 0, 주당 1인 15회 이상 |
+| **P3 앱 연동** | 3주 | ③ | GitHub App, 매니페스트 v1, 등록 파이프라인, 스모크 테스트, 사내 앱 2개 연동 | 새 앱 등록 30분 이내, 코드 수정 0줄 |
+| **P4 외부 제품화** | 6주 | ①②③ 외부 검증 | OAuth 심사, 셀프 온보딩, 앱 등록 UI, 모바일, 과금, 보안 점검 | 외부 3개 회사 파일럿, 온보딩 10분 이내 |
+| **P5 고도화** | 지속 | — | 화면·카메라 멀티모달, 전화 연결, 코드 작업(Jules), 업무 확장(2.4 기준) | — |
 
----
-
-## 9. 비용 개략 (대화 1분, 2차 출처 단가 기준 추정)
-
-| 항목 | 추정 | 비고 |
-|---|---|---|
-| Live 오디오 입력 (약 1,900 토큰/분 × $3/M) | ~$0.006 | |
-| Live 오디오 출력 (발화 비율 50% 가정 × $12/M) | ~$0.012 | |
-| 시스템 프롬프트·도구 호출 텍스트 | ~$0.005 | |
-| Flash 서브에이전트(문서 판독 건당) | ~$0.002 | |
-| **합계** | **약 $0.02~0.04/분** | v1(Claude+외부 음성) 추정 $0.06~0.12/분 대비 1/3 수준 |
-
-단가는 2차 출처 기준이므로 Google 공식 가격표로 재확인 필요. 방식 B는 Cloud Run 오디오 중계 비용 소폭 추가.
+**단계 전환 규칙**: 앞 단계의 "오발송 0"이 깨지면 다음 단계로 넘어가지 않고 원인 수정 후 재검증한다.
 
 ---
 
-## 10. 리스크와 대응
+## 6. 기술 스택
+
+| 영역 | 선택 |
+|---|---|
+| 에이전트 | Python 3.12, `google-adk`, `google-genai` |
+| 모델 | gemini-3.8-live / 3.8-flash / 3.8-pro (Vertex AI) |
+| 배포 | Vertex AI Agent Engine + Cloud Run (토큰 발급·웹훅·REST·취소 큐) |
+| 클라이언트 | React PWA (TypeScript), `@google/genai` live.connect |
+| 데이터 | Firestore(앱 레지스트리·사용자·사전), Cloud SQL(감사로그), Secret Manager(OAuth) |
+| 도구 | Workspace REST 래핑, OpenAPIToolset, MCPToolset, GitHub App |
+
+---
+
+## 7. 비용 (대화 1분, 2차 출처 단가 기준 추정)
+
+| 항목 | 추정 |
+|---|---|
+| Live 오디오 입력/출력 | ~$0.018 |
+| 시스템 프롬프트·도구 호출·사전 주입 텍스트 | ~$0.006 |
+| Flash 문서 판독(건당) | ~$0.002 |
+| **합계** | **약 $0.02~0.04/분** |
+
+사용자당 월 300분 사용 가정 시 모델 비용 약 $6~12. Google 공식 가격표로 재확인 필요.
+
+---
+
+## 8. 리스크
 
 | 리스크 | 대응 |
 |---|---|
-| 세션 한도(15분/58분 보고) | 압축+재개 항상 켜기, 55분 선제 재접속, P2에서 장시간 부하 테스트 |
-| 오디오 입출력 시 함수 호출 품질 저하(구 문서 경고) | 3.8 Live에서 실측, 함수 이름·설명 한국어 예시 포함해 명확화, 실패 시 "다시 말씀해 주세요" 복구 |
-| 한국어 고유명사 오인식(거래처명) | 시스템 프롬프트에 사용자 연락처·거래처 사전 주입(캐시), 후보 재확인 |
-| 선제 발화가 항상 켜져 있어 원치 않을 때 말함 | 푸시투톡 모드에서는 버튼 해제 시 마이크 스트림 중단 |
-| 오발송·오삭제 | 서버 정책 엔진 강제 + 30초 취소 윈도우 + 감사 로그 |
-| Google OAuth 민감 스코프 심사 지연 | P2 중 심사 서류 준비, 사내는 내부 앱으로 우회 |
-| 매니페스트 프롬프트 인젝션 | 설명 길이 제한·검증, risk 등급 강제, 사용자 앱 도구는 별도 네임스페이스 |
-| Google 종속 | 도구 레이어는 MCP/OpenAPI 표준으로 작성해 모델 교체 시 재사용 가능하게 유지 |
+| 음성 오인식으로 잘못된 수신자 | 고유명사 사전, 유사 이름 선택지 강제, 신규 주소 2중 확인, 30초 취소 |
+| 확인 단계가 번거로워 사용 포기 | `auto` 범위 넓게, `strict`는 발송·삭제·결제만, 확인 포기율 10% 넘으면 템플릿 단축 |
+| 세션 한도(15분/58분) | 압축·재개·55분 재접속, 장시간 테스트 |
+| 사무실에서 음성 사용 어색 | 이동·현장·1인 업무 상황을 1차 타깃, 텍스트 입력 병행 지원 |
+| 매니페스트 인젝션·악성 앱 | 스키마 검증, 설명 길이 제한, 네임스페이스 분리, 스모크 테스트 |
+| Google OAuth 심사 지연 | P2 중 서류 착수, 사내는 내부 앱 |
+| 빅테크 범용 비서와의 경쟁 | 범용 안 함. 세 업무 깊이 + 자체 앱 연동으로만 승부 |
+| Google 종속 | 도구 레이어를 OpenAPI/MCP 표준으로 유지해 모델 교체 가능 |
 
 ---
 
-## 11. 바로 시작할 일 (P0 첫 주)
+## 9. 첫 주 할 일
 
-1. GCP 프로젝트 생성, Vertex AI·Gmail·Calendar·Drive·Sheets API 활성화, 내부용 OAuth 동의화면
-2. `pip install google-adk` → `LlmAgent(model="gemini-3.8-live")` 골격, 도구 3개(gmail_send, calendar_create, drive_upload), 확인 게이트
-3. `adk web`으로 텍스트 모드 검증 → `run_live()`로 음성 전환
-4. Ephemeral Token 발급 엔드포인트 + 브라우저 `live.connect()` 샘플 (방식 A)
-5. 사내 테스트 시나리오 10개(평가셋) + 지연·성공률 측정 스크립트
+1. GCP 프로젝트, Vertex AI·Gmail·Drive·Calendar·Sheets API, 내부용 OAuth 동의화면
+2. 정책 엔진 골격: 등급 테이블, strict 확인 템플릿, 확인 토큰, 감사 로그 스키마
+3. ADK `LlmAgent(model="gemini-3.8-live")` + 업무 A·C 도구 5개 (`drive_upload`, `sheets_append`, `gmail_send`, `calendar_create`, `calendar_list`)
+4. 평가셋 60개 중 업무 A·C 40개 작성, 자동 실행 스크립트
+5. 사내 거래처·연락처 사전 CSV 정리 (고유명사 주입용)
 
 ---
 
@@ -222,13 +252,10 @@ Streamable HTTP MCP URL만 등록. ADK `MCPToolset`으로 연결.
 
 - Gemini 3.8 Live 모델 페이지: https://ai.google.dev/gemini-api/docs/models/gemini-3.8-live
 - Gemini 3.8 Live 개발자 가이드: https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/guides/gemini-3-8-live
-- Live API 세션 관리(압축·재개): https://ai.google.dev/gemini-api/docs/live-api/session-management
-- Live API 모범 사례: https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/live-api/best-practices
+- Live API 세션 관리: https://ai.google.dev/gemini-api/docs/live-api/session-management
 - Ephemeral Tokens: https://ai.google.dev/gemini-api/docs/ephemeral-tokens
-- ADK Live/음성 에이전트: https://adk.dev/live/index
-- ADK 스트리밍 개발 가이드: https://google.github.io/adk-docs/streaming/dev-guide/part3
+- ADK Live 에이전트: https://adk.dev/live/index
 - Agent Engine Memory Bank: https://docs.cloud.google.com/agent-builder/agent-engine/memory-bank/set-up
-- Google Workspace 공식 MCP(Drive 프리뷰): https://www.developersdigest.tech/mcp-servers/google-workspace-drive
 - 58분 세션 종료 보고(커뮤니티): https://discuss.ai.google.dev/t/gemini-3-8-live-live-sessions-are-closed-at-exactly-58-00-with-1011-deadline-expired-resumption-afterwards-fails-with-1007/186392
-- Gemini 3.8 Live 가격(2차 출처): https://aireiter.com/blog/gemini-3-8-live-api-pricing
-- Gemini 3.8 Flash 가격(2차 출처): https://llmgateway.io/models/gemini-3.8-flash
+- 경쟁 조사: April (YC S25) https://news.ycombinator.com/item?id=45015230 , 국내 AI 비서 동향 https://biz.heraldcorp.com/article/10911238
+- 가격(2차 출처): https://aireiter.com/blog/gemini-3-8-live-api-pricing
